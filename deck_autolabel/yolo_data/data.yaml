@@ -1,0 +1,6 @@
+
+# number of classes
+nc: 8
+
+# class names
+names: [ "cannon", "fireball", "hog-rider", "ice-golem", "ice-spirit", "log", "musketeer", "skeleton" ]
