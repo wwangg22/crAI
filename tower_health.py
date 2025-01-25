@@ -406,3 +406,8 @@ class TowerHealth():
         if self.friendly_princess_tower_hp is not None and self.enemy_princess_tower_hp is not None and self.friendly_king_tower_hp is not None and self.enemy_king_tower_hp is not None:
             final_arr = np.concatenate((self.friendly_princess_tower_hp/self.max_princess_tower_hp, self.enemy_princess_tower_hp/self.max_princess_tower_hp, [self.friendly_king_tower_hp/self.max_king_tower_hp], [self.enemy_king_tower_hp/self.max_king_tower_hp]))
             return final_arr
+        else:
+            return np.zeros((6,))
+        
+    def getDim(self):
+        return 6

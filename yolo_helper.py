@@ -130,4 +130,8 @@ class YoloModel():
 
             return output_array
 
-
+    def getDim(self):
+        if self.deck:
+            return 16
+        else:
+            return 60

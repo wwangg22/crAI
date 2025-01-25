@@ -27,3 +27,6 @@ class Elixir():
 
     def getElixir(self):
         return np.full((1,), self.elixir)
+    
+    def getDim(self):
+        return 1

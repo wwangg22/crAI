@@ -1,21 +1,39 @@
 import numpy as np
 import torch
 import gym
-import random  # Import random module
-from agents import *
+from agents import *  # Ensure your agent classes are correctly imported
 from ReplayBuffer import ReplayBuffer
+import minigrid  # Correct import for the new package
 
 # Set device
 cuda_available = torch.cuda.is_available()
 device = torch.device("cuda" if cuda_available else "cpu")
-train_per_epoch = 10
+
+# Helper function to preprocess MiniGrid observations
+def preprocess_obs(obs):
+    """
+    Flatten the 'image' and concatenate the 'direction' to form a single flat vector.
+    
+    Args:
+        obs (dict): Observation from MiniGrid environment.
+    
+    Returns:
+        np.ndarray: Flattened observation vector.
+    """
+    image = obs['image']  # Shape: (7, 7, 3) by default
+    direction = obs['direction']  # Scalar
+    flattened_image = image.flatten()  # Shape: (147,)
+    return np.concatenate([flattened_image, np.array([direction], dtype=np.float32)])  # Shape: (148,)
 
 # Define the main training loop
-def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batch_size=64, buffer_capacity=200):
+def train_agent(env_name='MiniGrid-Empty-8x8-v0', num_episodes=1500, max_steps=1000, batch_size=32, buffer_capacity=64):
     env = gym.make(env_name)
-    observation_dim = env.observation_space.shape[0]
+    initial_reset = env.reset()
+    initial_obs, _ = initial_reset  # Unpack the tuple
+    obs_processed = preprocess_obs(initial_obs)
+    observation_dim = obs_processed.shape[0]
     action_space = env.action_space
-    print("finished making env")
+    print("Finished making environment")
 
     # Determine if action space is discrete or continuous
     if isinstance(action_space, gym.spaces.Discrete):
@@ -28,11 +46,10 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
         raise NotImplementedError("Unsupported action space type.")
 
     # Action representation dimension (for LSTM input)
-    action_rep_dim = 1
+    action_rep_dim = 1  # Adjust if actions have higher dimensions
 
     # Define hidden state shape
     lstm_layers = 1
-    lstm_size = 128
     hidden_size = 16
     hidden_shape = (lstm_layers, hidden_size)
 
@@ -41,12 +58,11 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
         observation_dim=observation_dim,
         action_dim=action_dim,
         action_rep_dim=action_rep_dim,
-        lstm_dim=lstm_size,
         latent_dim=hidden_size,
         lstm_layers=lstm_layers,
         discrete=discrete,
-        lr=3e-5,
-        gamma=0.9,
+        lr=3e-4,
+        gamma=0.99,
         lamb=0.95,
         epsilon=0.2,
         tau=1.0,
@@ -62,12 +78,11 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
 
     # Initialize hidden states
     hidden = None
-    reward_history=[]
-    total_step = 0
-
 
     for episode in range(num_episodes):
-        obs, _ = env.reset()
+        initial_reset = env.reset()
+        initial_obs, _ = initial_reset  # Unpack the tuple
+        obs = preprocess_obs(initial_obs)
         total_reward = 0
         done = False
         step = 0
@@ -86,52 +101,42 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
         cn_states = None
 
         while not done and step < max_steps:
-            # Introduce noise: with 50% probability, set a random index in obs to 0
-
-            # Get action and log probability from the agent using the potentially noisy observation
+            # Get action and log probability from the agent
             (action, log_prob), (hn, cn) = agent.get_action(obs, prev_action, hidden)
-
+            # Execute action in the environment
             next_obs, reward, done, truncated, _ = env.step(action[0])
-
-            # if random.random() < 0.8:
-
-                # noisy_obs = next_observation.copy()
-            next_obs[2] = 0
-            next_obs[3] = 0
-            # noisy_obs = np.zeros_like(next_obs)
-            # random_index = random.randint(0, (len(noisy_obs) - 1))
-            # noisy_obs[random_index] = next_obs[random_index]
-            # #     # noisy_obs[random_index + 2] = 0.0
-            # next_obs = noisy_obs
-            # Optional: You can log or print which index was zeroed
-            # print(f"Zeroed index {random_index} in observation")
-            
             done = done or truncated
             total_reward += reward
+
+            # Preprocess next observation
+            next_obs_processed = preprocess_obs(next_obs)
 
             # Store data in lists
             observations.append(obs)
             actions.append(action)
             rewards.append([reward])  # Shape (1,)
-            next_observations.append(next_obs)
+            next_observations.append(next_obs_processed)
             dones.append([float(done)])  # Shape (1,)
             log_probs.append([log_prob])
             prev_actions.append(prev_action if prev_action is not None else np.zeros(action_rep_dim, dtype=np.float32))
+            
+            # Keep hn and cn as tensors and concatenate
             hn = hn.detach()
             cn = cn.detach()
             if hn_states is None:
-                hn_states = hn
+                hn_states = hn  # Shape: (num_layers, 1, hidden_size)
                 cn_states = cn
             else:
-                hn_states = torch.cat((hn_states, hn), dim=1)
+                hn_states = torch.cat((hn_states, hn), dim=1)  # Concatenate along the sequence dimension
                 cn_states = torch.cat((cn_states, cn), dim=1)
             hidden = (hn, cn)
 
             # Prepare for next step
-            obs = next_obs
+            obs = next_obs_processed
             prev_action = action
-            
-            if step % 16 == 0 and hn_states is not None:
+
+            # Periodically add to replay buffer
+            if step % 32 == 0 and hn_states is not None:
                 observations_np = np.array(observations, dtype=np.float32)
                 actions_np = np.array(actions, dtype=np.int64)
                 rewards_np = np.array(rewards, dtype=np.float32)
@@ -146,7 +151,7 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
                     rewards_np,
                     dones_np,
                     prev_actions_np,
-                    hn_states[:, 0, :].unsqueeze(1),
+                    hn_states[:, 0, :].unsqueeze(1),  # Shape: (num_layers, 1, hidden_size)
                     cn_states[:, 0, :].unsqueeze(1),
                     actions_np
                 )
@@ -162,6 +167,7 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
                     cn=cn_states,
                     prev_action=prev_actions_np
                 )
+                # Clear trajectory lists
                 observations = []
                 actions = []
                 rewards = []
@@ -171,13 +177,9 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
                 prev_actions = []
                 hn_states = None
                 cn_states = None
-
-                # sample = replay_buffer.sample(batch_size)
-                #    # Update the agent
-                # val_loss, actor_loss = agent.learn(sample)
             step += 1
-        total_step += step
-        reward_history.append(total_reward)
+
+        print(total_reward)
         if step != 1 and hn_states is not None:
             observations_np = np.array(observations, dtype=np.float32)
             actions_np = np.array(actions, dtype=np.int64)
@@ -209,25 +211,19 @@ def train_agent(env_name='CartPole-v1', num_episodes=100000, max_steps=500, batc
                 cn=cn_states,
                 prev_action=prev_actions_np
             )
-        # After the episode, calculate advantages
-        # For simplicity, we'll use the Temporal Difference (TD) residuals as advantages
-        # In practice, you might want to use Generalized Advantage Estimation (GAE)
 
-        # print(f"Episode {episode + 1}/{num_episodes}, Total Reward: {total_reward}")
-        if episode % 100 ==0:
-            # print(reward_history)
-            print(np.mean(reward_history[-100:]), " num episode: ", episode, " total steps: ", total_step)
+        print(f"Episode {episode + 1}/{num_episodes}, Total Reward: {total_reward}")
+
         # Perform learning step if enough samples are available
         if len(replay_buffer) >= batch_size:
             try:
-                   for a in range(train_per_epoch):
-                        sample = replay_buffer.sample(batch_size)
-                        # Update the agent
-                        val_loss, actor_loss = agent.learn(sample)
-                   # print(f"Training Update - Value Loss: {val_loss.item():.4f}, Actor Loss: {actor_loss.item():.4f}")
+                sample = replay_buffer.sample(batch_size)
+                # Update the agent
+                val_loss, actor_loss = agent.learn(sample)
+                print(f"Training Update - Value Loss: {val_loss.item():.4f}, Actor Loss: {actor_loss.item():.4f}")
             except Exception as e:
                 print(f"Training update failed: {e}")
 
 if __name__ == "__main__":
-    print("hello")
+    print("Starting training...")
     train_agent()

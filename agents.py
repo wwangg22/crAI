@@ -3,6 +3,7 @@ import itertools
 import torch
 import torch.nn as nn
 from torch import optim
+import torch.nn.functional as F
 
 
 cuda_available = torch.cuda.is_available()
@@ -23,7 +24,7 @@ def buildMLP(input_dim, output_dim, network_shape):
 
 
 class LSTMFeatureExtractor(nn.Module):
-    def __init__(self, input_size=100, hidden_size=256, num_layers=1, device='cpu'):
+    def __init__(self, input_size=100, lstm_size = 256, hidden_size=256, num_layers=1, device='cpu'):
         """
         Initializes the LSTMFeatureExtractor.
 
@@ -46,6 +47,8 @@ class LSTMFeatureExtractor(nn.Module):
             num_layers=num_layers,
             batch_first=True
         )
+
+        # self.linear = nn.Linear(lstm_size, hidden_size)
         
     def forward(self, x, hx=None):
         """
@@ -64,6 +67,9 @@ class LSTMFeatureExtractor(nn.Module):
         """
         # x is already of shape (batch_size, seq_len, input_size)
         output, (h_n, c_n) = self.lstm(x, hx)
+
+        # Apply linear layer to the output of the LSTM
+        # output = F.relu(self.linear(output))
         
         return output, (h_n, c_n)
 
@@ -85,7 +91,7 @@ class ValueNetwork(nn.Module):
         # )
         self.loss_fn = nn.MSELoss()
         self.step = 0
-        self.gamma = 0.9
+        self.gamma = 0.999
         self.target_update = update_target_step
 
     def updateTarget(self, tau=None):
@@ -190,15 +196,16 @@ class Actor(nn.Module):
             self.low = torch.from_numpy(low).float()
     
     @torch.no_grad()
-    def get_action(self, observation):
+    def get_action(self, observation, mask=None):
         if isinstance(observation, np.ndarray):
             observation = torch.from_numpy(observation).float()
+        
         assert observation.dim() == 1
         observation = observation.to(device)
         if self.discrete:
             log_prob = 0
             sampled_action = []
-            distribution = self.forward(observation=observation)
+            distribution = self.forward(observation=observation, mask=mask)
             for dis in distribution:
                 ac = dis.sample()
                 log_prob += dis.log_prob(ac).cpu().item()
@@ -214,7 +221,7 @@ class Actor(nn.Module):
         
         return sampled_action, log_prob
     
-    def forward(self, observation):
+    def forward(self, observation, mask=None):
         """
         for the discrete case, this function return a LIST of torch distributions
         """
@@ -222,11 +229,22 @@ class Actor(nn.Module):
             observation = torch.from_numpy(observation).float()
         observation = observation.to(device)
 
+        if isinstance(mask, np.ndarray):
+            mask = torch.from_numpy(mask).bool()
+
         if self.discrete:
             logits = [head(observation) for head in self.logits]  # List of tensors
             distribution = []
-            for logit in logits:
-                distribution.append(torch.distributions.Categorical(logits = logit))
+            for ind, logit in enumerate(logits):
+                # Apply mask if provided
+                if mask is not None:
+                    # Create a large negative value to effectively zero out masked logits
+                    masked_logits = logit.clone()
+                    masked_logits[~mask[ind]] = float('-inf')
+                else:
+                    masked_logits = logit
+                # Create distribution with masked logits
+                distribution.append(torch.distributions.Categorical(logits=masked_logits))
         else:
             mean = self.mean(observation)
             # print("mean shape", mean.shape)
@@ -237,14 +255,14 @@ class Actor(nn.Module):
 
 class PPOLSTMAgent(nn.Module):
 
-    def __init__(self, observation_dim, action_dim, action_rep_dim,  latent_dim = 256, lstm_layers = 1, discrete = True, lr = 3e-4, gamma=0.99, lamb = 0.95, epsilon = 0.2, tau=1.0, value_network_shape = [256, 256], high=None, low= None):
+    def __init__(self, observation_dim, action_dim, action_rep_dim, lstm_dim = 256, latent_dim = 256, lstm_layers = 1, discrete = True, lr = 3e-4, gamma=0.99, lamb = 0.95, epsilon = 0.2, tau=1.0, value_network_shape = [256, 256], high=None, low= None):
         super().__init__()
         self.value = ValueNetwork(observation_dim=latent_dim, lr=lr, network_shape=value_network_shape)
         self.actor = Actor(observation_dim=latent_dim, lr=lr, action_dim=action_dim, discrete=discrete, high = high, low= low)
-        self.lstm = LSTMFeatureExtractor(input_size=observation_dim + action_rep_dim, hidden_size=latent_dim, num_layers=lstm_layers)
+        self.lstm = LSTMFeatureExtractor(input_size=observation_dim + action_rep_dim, lstm_size= lstm_dim, hidden_size=latent_dim, num_layers=lstm_layers)
 
         self.optimizer = optim.Adam(
-            itertools.chain(self.lstm.parameters(), self.value.parameters(), self.actor.parameters()),
+            itertools.chain(self.lstm.parameters(), self.value.parameters(), self.actor.params),
             lr=lr
         )
         self.tau = tau
@@ -479,5 +497,338 @@ class PPOLSTMAgent(nn.Module):
         self.optimizer.step()
 
         return val_loss, actor_loss
+    
+
+
+class ValueNetwork(nn.Module):
+
+    def __init__(self, observation_dim, lr = 3e-4, network_shape = [256, 256], tau = 1.0, target = False, update_target_step = 500):
+        super().__init__()
+        self.use_target = target
+        self.tau = tau
+        self.model = buildMLP(observation_dim, 1, network_shape).to(device)
+        if self.use_target:
+            self.target = buildMLP(observation_dim, 1, network_shape).to(device)
+            self.updateTarget(self.tau)
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr = lr
+        )
+        self.loss_fn = nn.MSELoss()
+        self.step = 0
+        self.gamma = 0.9
+        self.target_update = update_target_step
+
+    def updateTarget(self, tau):
+        for param, target_param in zip(self.model.parameters(), self.target.parameters()):
+            target_param.data.copy_(
+                target_param.data * (1.0 - tau) + param.data * tau
+            )
+
+
+    def forward(self, observation) -> torch.Tensor:
+        if isinstance(observation, np.ndarray):
+            observation = torch.from_numpy(observation).float()
+        
+        observation = observation.to(device)
+        
+        assert isinstance(observation, torch.Tensor) == True
+
+        pred = self.model(observation)
+
+        return pred
+    
+    def update(self, observations, advantages, next_observation, reward, done):
+        if isinstance(observations, np.ndarray):
+            observations = torch.from_numpy(observations).float()
+        observations = observations.to(device)
+
+        if isinstance(advantages, np.ndarray):
+            advantages = torch.from_numpy(advantages).float()
+        advantages = advantages.to(device)
+
+        if isinstance(next_observation, np.ndarray):
+            next_observation = torch.from_numpy(next_observation).float()
+        next_observation = next_observation.to(device)
+
+        if isinstance(reward, np.ndarray):
+            reward = torch.from_numpy(reward).float()
+        reward = reward.to(device)
+
+        done = torch.from_numpy(done).float().to(device)
+
+        value_pred = self.model(observations)
+
+        with torch.no_grad():
+            if self.use_target:
+                value_target = self.target(observations) + advantages
+            else:
+                value_target = self.model(observations) + advantages
+
+        # with torch.no_grad():
+        #     value_target = (1-done) * self.gamma * self.model(next_observation) + reward
+        
+        loss = self.loss_fn(value_pred, value_target)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.use_target:
+            if self.step % self.target_update == 0:
+                self.updateTarget()
+        self.step+=1
+
+        return loss
+
+
+class Actor(nn.Module):
+
+    def __init__(self, observation_dim, action_dim, lr=3e-4, discrete = True, network_shape = [256, 256], epsilon = 0.2, high = None, low = None):
+        super().__init__()
+        if discrete:
+                assert isinstance(action_dim, list)
+                self.logits = nn.ModuleList([
+                    buildMLP(observation_dim, act_dim, network_shape).to(device) for act_dim in action_dim
+                ])
+
+                # Collect all parameters for optimizer
+                self.params = [param for head in self.logits for param in head.parameters()]
+        else:
+            self.mean = buildMLP(observation_dim, action_dim, network_shape).to(device)
+            self.logstd = nn.Parameter(
+                    torch.zeros(action_dim, dtype=torch.float32, device=device)            
+                    )
+            self.params = itertools.chain([self.logstd], self.mean.parameters())
+
+        self.optimizer = optim.Adam(
+            self.params,
+            lr
+        )
+
+        self.discrete = discrete
+        self.epsilon = epsilon
+        if high is not None:
+            self.high = torch.from_numpy(high).float()
+            self.low = torch.from_numpy(low).float()
+    
+    @torch.no_grad()
+    def get_action(self, observation, mask = None):
+        if isinstance(observation, np.ndarray):
+            observation = torch.from_numpy(observation).float()
+        assert observation.dim() == 1
+        observation = observation.to(device)
+
+        if isinstance(mask, np.ndarray):
+        # `mask` is just a single NumPy array
+            mask = torch.from_numpy(mask).bool()
+        elif isinstance(mask, list):
+            # `mask` is a list of NumPy arrays
+            mask = [torch.from_numpy(m).bool() for m in mask]
+        if self.discrete:
+            log_prob = 0
+            sampled_action = []
+            masked_logits = self.forward(observation=observation, mask = mask[0])
+
+      
+            dis = torch.distributions.Categorical(logits=masked_logits[0])
+            ac = dis.sample()
+            log_prob += dis.log_prob(ac).cpu().item()
+            sampled_action.append(ac.cpu().numpy())
+            
+            masked = masked_logits[1].clone()
+            # print(mask[1+ac.cpu().item()])
+            # print(len(mask[1+ac.cpu().item()]))
+            # print(masked)
+            # print(1+ac.cpu().item())
+            # print(mask[1+ac.cpu().item()])
+            # print(len(mask[1+ac.cpu().item()]))
+            # print(len(masked))
+            masked[~mask[1+ac.cpu().item()]] = float('-inf')
+            # print(masked)
+            dis2 = torch.distributions.Categorical(logits=masked)
+            ac2 = dis2.sample()
+            log_prob += dis2.log_prob(ac2).cpu().item()
+            sampled_action.append(ac2.cpu().numpy())
+
+            sampled_action = np.array(sampled_action)
+            return sampled_action, log_prob, mask[0], mask[1+ac.cpu().item()]
+        else:
+            mean = self.mean(observation)
+            distribution = torch.distributions.Normal(loc=mean, scale=torch.exp(self.logstd))
+            sampled_action = distribution.sample().cpu().numpy()
+            log_prob = distribution.log_prob(sampled_action).sum(dim=-1).cpu().numpy()
+        # if self.low is not None:
+        #     sampled_action = torch.clamp(sampled_action, min=self.low, max=self.high)
+        
+        return sampled_action, log_prob
+    
+    def forward(self, observation, mask =None):
+        if isinstance(observation, np.ndarray):
+            observation = torch.from_numpy(observation).float()
+        observation = observation.to(device)
+    
+
+        if self.discrete:
+            logits = [head(observation) for head in self.logits]  # List of tensors
+            masked = []
+
+            masked_logits1 = logits[0]
+            masked_logits1[~mask] = float('-inf')
+
+            masked_logits2 = logits[1]
+            masked.append(masked_logits1)
+            masked.append(masked_logits2)
+            return masked
+            # for ind, logit in enumerate(logits):
+            #     # Apply mask if provided
+            #     if mask is not None and len(mask) > ind:
+            #         # Create a large negative value to effectively zero out masked logits
+            #         masked_logits = logit.clone()
+            #         masked_logits[~mask[ind]] = float('-inf')
+            #     else:
+            #         masked_logits = logit
+            #     # Create distribution with masked logits
+            #     masked.append(masked_logits)
+            #     # distribution.append(torch.distributions.Categorical(logits=masked_logits))
+            # return masked
+        else:
+            mean = self.mean(observation)
+            # print("mean shape", mean.shape)
+            distribution = torch.distributions.Normal(loc = mean, scale = torch.exp(self.logstd))
+        
+        return distribution
+
+
+
+
+
+class CRPPOAgent(nn.Module):
+
+    def __init__(self, observation_dim, action_dim, discrete = True, lr = 3e-4, gamma=0.99, lamb = 0.95, epsilon = 0.2, tau=1.0, value_network_shape = [256, 256], high=None, low= None):
+        super().__init__()
+        self.value = ValueNetwork(observation_dim=observation_dim, lr=lr, network_shape=value_network_shape)
+        self.actor = Actor(observation_dim=observation_dim, lr=lr, action_dim=action_dim, discrete=discrete, high = high, low= low)
+        self.tau = tau
+        self.lamb = lamb
+        self.gamma = gamma
+        self.high = high
+        self.low = low
+        self.num_val = 10
+        self.discrete = discrete
+
+        self.epsilon = epsilon
+
+        self.prev_prob = None
+
+    def calculate_advantage(self, observation, next_observation, rewards, dones):
+        if isinstance(observation, np.ndarray):
+            observation = torch.from_numpy(observation).float()
+        observation = observation.to(device)
+        size = observation.shape[0]
+        
+
+        advantages = np.zeros(size+1)
+        
+        for i in reversed(range(size)):
+            if dones[i]:
+                delta = rewards[i] - self.value.forward(observation[i]).detach().cpu().numpy().squeeze()
+            else:
+                delta = rewards[i] + self.gamma*self.value.forward(next_observation[i]).detach().cpu().numpy().squeeze() - self.value.forward(observation[i]).detach().cpu().numpy().squeeze()
+
+            advantages[i] = delta + self.gamma*self.lamb * advantages[i+1]
+
+        advantages = advantages[:-1]
+        return advantages
+
+    def get_action(self, observation, mask=None):
+        return self.actor.get_action(observation, mask=mask)
+    
+    def update_actor(self, observation, actions, advantages, old_log_probs, masks):
+        # mask is given by dim (2, batch, mask_dim)
+        if isinstance(observation, np.ndarray):
+            observation = torch.from_numpy(observation).float()
+        observation = observation.to(device)
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions).float()
+        actions = actions.to(device)
+        if isinstance(advantages, np.ndarray):
+            advantages = torch.from_numpy(advantages).float()
+        advantages = advantages.to(device)
+        if isinstance(old_log_probs, np.ndarray):
+            old_log_probs = torch.from_numpy(old_log_probs).float()
+        old_log_probs = old_log_probs.to(device)
+
+        batch_size = observation.shape[0]
+
+        if actions.dim() != 2:
+            actions = actions.unsqueeze(1)
+
+        if self.discrete:
+            logits = self.actor.forward(observation)
+            log_probs = torch.zeros(batch_size, dtype=torch.float32, device=device)
+            
+            for i in range(batch_size):
+                masked_logits1 = logits[0][i].clone()
+                masked_logits1[~masks[0][i]] = float('-inf')
+
+                masked_logits2 = logits[1][i].clone()
+                masked_logits2[~masks[1][i]] = float('-inf')
+                dist1 = torch.distributions.Categorical(logits=masked_logits1)
+                dist2 = torch.distributions.Categorical(logits=masked_logits2)
+                
+                log_probs += dist1.log_prob(actions[i,0])
+                log_probs += dist2.log_prob(actions[i,1])
+        else:
+            dist = self.actor.forward(observation)
+            log_probs = dist.log_prob(actions).sum(-1)
+        
+        r = (log_probs - old_log_probs).exp()
+
+        clipped = torch.clamp(r, min = 1.0 - self.epsilon, max=1.0 + self.epsilon)
+
+        clipped_obj = clipped * advantages
+        unclipped_obj = r * advantages
+
+        min_obj = torch.min(clipped_obj, unclipped_obj)
+        loss = -min_obj.mean()
+
+        self.actor.optimizer.zero_grad()
+        loss.backward()
+        self.actor.optimizer.step()
+        return loss
+
+    def learn(self, sample):
+        """
+        passed as 
+         "observations": self.observation[rand_indices],
+            "actions": self.action[rand_indices],
+            "rewards": self.reward[rand_indices],
+            "next_observations": self.next_observation[rand_indices],
+            "dones": self.done[rand_indices],
+            "advantages": self.advantage[rand_indices],
+            "log_probs": self.log_probs[rand_indices],
+        """
+        observations = sample["observations"]
+        actions = sample["actions"]
+        rewards = sample["rewards"]
+        next_observations = sample["next_observations"]
+        dones = sample["dones"]
+        advantages = sample["advantages"]
+        log_probs = sample["log_probs"]
+        if isinstance(advantages, np.ndarray):
+            advantages = torch.from_numpy(advantages).float()
+        advantages = advantages.to(device)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # for a in range(self.num_val):
+        val_loss = self.value.update(observations, advantages, next_observations, rewards, dones)
+
+        actor_loss = self.update_actor(observations,actions, advantages, log_probs)
+
+        return val_loss, actor_loss
+
+    
+
     
         

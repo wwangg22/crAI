@@ -80,7 +80,7 @@ class SendCommand():
             raise ConnectionError("Not connected. Call connect() first.")
 
         self.sock.sendall(command.encode('utf-8'))
-
+        print('sending command')
         return self.read_response()
 
     def get_tick(self):
