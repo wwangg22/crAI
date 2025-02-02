@@ -1,7 +1,8 @@
-autolabel/
-deck_autolable/
-icon_robo/
-icon_training/
-testing/
+image_detection_training/autolabel/
+image_detection_training/deck_autolable/
+image_detection_training/icon_robo/
+image_detection_training/icon_training/
+image_detection_training/temp/
+testing_files/
 out/
 __pycache__/
